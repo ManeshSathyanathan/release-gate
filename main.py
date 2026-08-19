@@ -169,3 +169,224 @@ def release_gate(data: ReleaseRequest):
         "decision": decision,
         "violations": violations
     }
+from urllib.parse import urlparse
+import re
+
+
+ALLOWED_TENANT = "tenant-6hekv7t"
+ALLOWED_EMAIL_DOMAIN = "notify-c29oo3y.example"
+
+EVENT_HANDLER_RE = re.compile(r'on[a-zA-Z]+\s*=', re.IGNORECASE)
+JAVASCRIPT_URL_RE = re.compile(r'javascript\s*:', re.IGNORECASE)
+SCRIPT_RE = re.compile(r'<\s*script\b', re.IGNORECASE)
+IFRAME_RE = re.compile(r'<\s*iframe\b', re.IGNORECASE)
+
+
+def exact_keys(obj, expected_keys):
+    return isinstance(obj, dict) and set(obj.keys()) == set(expected_keys)
+
+
+@app.post("/action-firewall")
+def action_firewall(payload: dict):
+
+    # 1. TOP-LEVEL SCHEMA
+    if not exact_keys(
+        payload,
+        {"provenance", "humanApproved", "action"}
+    ) and not exact_keys(
+        payload,
+        {"provenance", "humanApproved", "untrustedContent", "action"}
+    ):
+        return {
+            "decision": "block",
+            "reason": "INVALID_SCHEMA"
+        }
+
+    if payload.get("provenance") not in ["trusted", "untrusted"]:
+        return {
+            "decision": "block",
+            "reason": "INVALID_SCHEMA"
+        }
+
+    if not isinstance(payload.get("humanApproved"), bool):
+        return {
+            "decision": "block",
+            "reason": "INVALID_SCHEMA"
+        }
+
+    if "untrustedContent" in payload and not isinstance(
+        payload["untrustedContent"], str
+    ):
+        return {
+            "decision": "block",
+            "reason": "INVALID_SCHEMA"
+        }
+
+    action = payload.get("action")
+
+    if not exact_keys(action, {"tool", "args"}):
+        return {
+            "decision": "block",
+            "reason": "INVALID_SCHEMA"
+        }
+
+    if not isinstance(action["tool"], str):
+        return {
+            "decision": "block",
+            "reason": "INVALID_SCHEMA"
+        }
+
+    if not isinstance(action["args"], dict):
+        return {
+            "decision": "block",
+            "reason": "INVALID_SCHEMA"
+        }
+
+    tool = action["tool"]
+    args = action["args"]
+
+    # 2. TOOL ALLOWLIST
+    allowed_tools = {
+        "search",
+        "lookup_record",
+        "send_email",
+        "render_html"
+    }
+
+    if tool not in allowed_tools:
+        return {
+            "decision": "block",
+            "reason": "TOOL_NOT_ALLOWED"
+        }
+
+    # 3. TOOL ARGUMENT SCHEMA
+
+    if tool == "search":
+
+        if not exact_keys(args, {"query"}):
+            return {
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            }
+
+        query = args.get("query")
+
+        if (
+            not isinstance(query, str)
+            or len(query) < 1
+            or len(query) > 200
+        ):
+            return {
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            }
+
+    elif tool == "lookup_record":
+
+        if not exact_keys(args, {"tenantId", "recordId"}):
+            return {
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            }
+
+        if (
+            not isinstance(args.get("tenantId"), str)
+            or not isinstance(args.get("recordId"), str)
+            or len(args["recordId"]) == 0
+        ):
+            return {
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            }
+
+    elif tool == "send_email":
+
+        if not exact_keys(args, {"to", "subject", "body"}):
+            return {
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            }
+
+        if not all(
+            isinstance(args.get(k), str)
+            for k in ["to", "subject", "body"]
+        ):
+            return {
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            }
+
+    elif tool == "render_html":
+
+        if not exact_keys(args, {"html"}):
+            return {
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            }
+
+        if not isinstance(args.get("html"), str):
+            return {
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            }
+
+    # 4. TENANT SCOPE
+    if tool == "lookup_record":
+        if args["tenantId"] != ALLOWED_TENANT:
+            return {
+                "decision": "block",
+                "reason": "TENANT_SCOPE"
+            }
+
+    # 5. EXACT EMAIL DOMAIN
+    if tool == "send_email":
+
+        recipient = args["to"]
+
+        if recipient.count("@") != 1:
+            return {
+                "decision": "block",
+                "reason": "EGRESS_DENIED"
+            }
+
+        local_part, domain = recipient.rsplit("@", 1)
+
+        if (
+            not local_part
+            or domain != ALLOWED_EMAIL_DOMAIN
+        ):
+            return {
+                "decision": "block",
+                "reason": "EGRESS_DENIED"
+            }
+
+    # 6. HUMAN APPROVAL
+    if tool == "send_email":
+        if payload["humanApproved"] is not True:
+            return {
+                "decision": "block",
+                "reason": "APPROVAL_REQUIRED"
+            }
+
+    # 7. HTML SAFETY
+    if tool == "render_html":
+
+        html = args["html"]
+
+        unsafe = (
+            SCRIPT_RE.search(html)
+            or IFRAME_RE.search(html)
+            or EVENT_HANDLER_RE.search(html)
+            or JAVASCRIPT_URL_RE.search(html)
+        )
+
+        if unsafe:
+            return {
+                "decision": "block",
+                "reason": "UNSAFE_OUTPUT"
+            }
+
+    return {
+        "decision": "allow",
+        "reason": "ALLOW"
+    }
