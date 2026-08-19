@@ -16,7 +16,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: TDS identity: 22f3000236@ds.study.iitm.ac.in
+      - name: "TDS identity: 22f3000236@ds.study.iitm.ac.in"
         run: echo "22f3000236@ds.study.iitm.ac.in"
 
       - name: Set up Python
