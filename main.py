@@ -915,3 +915,221 @@ def sanitize_output(payload: dict):
         "safe": True,
         "reason": "SAFE"
     }
+
+from datetime import datetime, timezone
+
+
+OSINT_ALLOWED_TYPES = {
+    "dns",
+    "ct_log",
+    "registry",
+    "archive",
+    "scan"
+}
+
+
+def parse_iso8601(value):
+    if not isinstance(value, str):
+        return None
+
+    try:
+        # Support trailing Z
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+
+        dt = datetime.fromisoformat(value)
+
+        # Require timezone information
+        if dt.tzinfo is None:
+            return None
+
+        return dt.astimezone(timezone.utc)
+
+    except Exception:
+        return None
+
+
+def invalid_osint():
+    return {
+        "verdict": "invalid",
+        "confidence": "low",
+        "corroboratingSources": []
+    }
+
+
+@app.post("/corroborate")
+def corroborate(payload: Any):
+
+    # ---------------------------------------------------------
+    # 1. INVALID
+    # ---------------------------------------------------------
+
+    if not isinstance(payload, dict):
+        return invalid_osint()
+
+    claim = payload.get("claim")
+
+    if not isinstance(claim, dict):
+        return invalid_osint()
+
+    claim_value = claim.get("value")
+
+    if not isinstance(claim_value, str):
+        return invalid_osint()
+
+    as_of_raw = payload.get("asOf")
+    as_of = parse_iso8601(as_of_raw)
+
+    if as_of is None:
+        return invalid_osint()
+
+    staleness_days = payload.get("stalenessDays")
+
+    # bool is a subclass of int in Python, so reject it explicitly
+    if (
+        isinstance(staleness_days, bool)
+        or not isinstance(staleness_days, (int, float))
+    ):
+        return invalid_osint()
+
+    sources = payload.get("sources")
+
+    if not isinstance(sources, list):
+        return invalid_osint()
+
+    # ---------------------------------------------------------
+    # PREPARE VALID FRESH SOURCES
+    # ---------------------------------------------------------
+
+    valid_fresh_sources = []
+
+    for source in sources:
+
+        if not isinstance(source, dict):
+            continue
+
+        source_id = source.get("id")
+        source_origin = source.get("origin")
+        source_value = source.get("value")
+        observed_raw = source.get("observedAt")
+        source_type = source.get("type")
+
+        # Valid source definition
+        if not isinstance(source_id, str):
+            continue
+
+        if not isinstance(source_origin, str):
+            continue
+
+        if not isinstance(source_value, str):
+            continue
+
+        if not isinstance(observed_raw, str):
+            continue
+
+        if source_type not in OSINT_ALLOWED_TYPES:
+            continue
+
+        observed_at = parse_iso8601(observed_raw)
+
+        if observed_at is None:
+            continue
+
+        # Fresh means:
+        # asOf - observedAt <= stalenessDays
+        age_seconds = (as_of - observed_at).total_seconds()
+        max_age_seconds = staleness_days * 86400
+
+        if age_seconds > max_age_seconds:
+            continue
+
+        valid_fresh_sources.append({
+            "id": source_id,
+            "origin": source_origin,
+            "value": source_value,
+            "type": source_type,
+            "authoritative": source.get("authoritative") is True
+        })
+
+    # ---------------------------------------------------------
+    # 2. AUTHORITATIVE CONTRADICTION
+    # ---------------------------------------------------------
+
+    contradicting_ids = []
+
+    for source in valid_fresh_sources:
+        if (
+            source["authoritative"] is True
+            and source["value"] != claim_value
+        ):
+            contradicting_ids.append(source["id"])
+
+    if contradicting_ids:
+        return {
+            "verdict": "contradicted",
+            "confidence": "low",
+            "corroboratingSources": sorted(contradicting_ids)
+        }
+
+    # ---------------------------------------------------------
+    # 3. SUPPORTED
+    # Keep only fresh matching sources and reduce to one
+    # representative per origin.
+    # Representative = lexicographically smallest source id.
+    # ---------------------------------------------------------
+
+    matching_sources = [
+        source
+        for source in valid_fresh_sources
+        if source["value"] == claim_value
+    ]
+
+    representatives_by_origin = {}
+
+    for source in matching_sources:
+
+        origin = source["origin"]
+
+        if origin not in representatives_by_origin:
+            representatives_by_origin[origin] = source
+        else:
+            current = representatives_by_origin[origin]
+
+            if source["id"] < current["id"]:
+                representatives_by_origin[origin] = source
+
+    representatives = list(representatives_by_origin.values())
+
+    if len(representatives) >= 2:
+
+        representative_ids = sorted(
+            source["id"]
+            for source in representatives
+        )
+
+        representative_types = {
+            source["type"]
+            for source in representatives
+        }
+
+        confidence = (
+            "high"
+            if len(representative_types) >= 2
+            else "medium"
+        )
+
+        return {
+            "verdict": "supported",
+            "confidence": confidence,
+            "corroboratingSources": representative_ids
+        }
+
+    # ---------------------------------------------------------
+    # 4. UNVERIFIED
+    # ---------------------------------------------------------
+
+    return {
+        "verdict": "unverified",
+        "confidence": "low",
+        "corroboratingSources": []
+    }
