@@ -25,9 +25,10 @@ def home():
     return {"status": "Release Gate API is running"}
 
 
+@app.post("/release-gate")
 @app.post("/release_gate")
 def release_gate(data: ReleaseRequest):
-
+    
     violations = []
 
     workflow = data.workflow
