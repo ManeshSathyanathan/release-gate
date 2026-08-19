@@ -621,3 +621,297 @@ def terraform_plan(payload: dict):
         "decision": "approve",
         "reason": "APPROVE"
     }
+
+from urllib.parse import unquote, urlparse
+from html import unescape
+import re
+
+
+OUTPUT_ALLOWED_HOSTS = {
+    "cdn-ui4yoos.example",
+    "app-k46ex9k.example"
+}
+
+VALID_CHANNELS = {
+    "html",
+    "markdown",
+    "url",
+    "sql",
+    "shell"
+}
+
+
+SCRIPT_TAG_RE = re.compile(
+    r"<\s*(script|iframe|object|embed)\b",
+    re.IGNORECASE
+)
+
+EVENT_HANDLER_RE_2 = re.compile(
+    r"\bon[a-z0-9_-]+\s*=",
+    re.IGNORECASE
+)
+
+DANGEROUS_SCHEME_TEXT_RE = re.compile(
+    r"\b(javascript|data|vbscript)\s*:",
+    re.IGNORECASE
+)
+
+HTML_URL_RE = re.compile(
+    r"\b(?:src|href)\s*=\s*([\"'])(.*?)\1",
+    re.IGNORECASE | re.DOTALL
+)
+
+MARKDOWN_URL_RE = re.compile(
+    r"\]\(([^)]+)\)"
+)
+
+SQL_META_RE = re.compile(
+    r"""['";]|--|/\*|\bunion\b|\bor\s+1\s*=\s*1\b""",
+    re.IGNORECASE
+)
+
+SHELL_META_RE = re.compile(
+    r";|&|\||`|<|>|\$\(|\$\{"
+)
+
+UNICODE_ESCAPE_RE = re.compile(
+    r"\\u([0-9a-fA-F]{4})"
+)
+
+
+def decode_once(text: str) -> str:
+    # Required order:
+    # 1. percent escapes
+    # 2. HTML entities
+    # 3. \uXXXX escapes
+
+    decoded = unquote(text)
+    decoded = unescape(decoded)
+
+    decoded = UNICODE_ESCAPE_RE.sub(
+        lambda m: chr(int(m.group(1), 16)),
+        decoded
+    )
+
+    return decoded
+
+
+def extract_urls(channel: str, text: str):
+    urls = []
+
+    if channel == "html":
+        for match in HTML_URL_RE.finditer(text):
+            urls.append(match.group(2).strip())
+
+    elif channel == "markdown":
+        for match in MARKDOWN_URL_RE.finditer(text):
+            target = match.group(1).strip()
+
+            # Handle common markdown form:
+            # ](https://host/path "optional title")
+            if target.startswith("<") and ">" in target:
+                target = target[1:target.index(">")]
+            else:
+                target = target.split()[0] if target else ""
+
+            urls.append(target)
+
+    elif channel == "url":
+        urls.append(text.strip())
+
+    return urls
+
+
+def classify_url_problem(raw_url: str):
+    url = raw_url.strip()
+
+    if not url:
+        return None
+
+    # Explicit dangerous textual schemes
+    if DANGEROUS_SCHEME_TEXT_RE.search(url):
+        return "DANGEROUS_SCHEME"
+
+    # Protocol-relative references are absolute.
+    if url.startswith("//"):
+        parsed = urlparse("https:" + url)
+
+        if parsed.hostname not in OUTPUT_ALLOWED_HOSTS:
+            return "EXTERNAL_EXFIL"
+
+        return None
+
+    parsed = urlparse(url)
+
+    # Absolute URL with a scheme
+    if parsed.scheme:
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return "DANGEROUS_SCHEME"
+
+        hostname = parsed.hostname
+
+        if hostname not in OUTPUT_ALLOWED_HOSTS:
+            return "EXTERNAL_EXFIL"
+
+    # Relative URLs are allowed
+    return None
+
+
+def channel_rule_reason(channel: str, text: str):
+    # HTML rule order
+    if channel == "html":
+
+        if SCRIPT_TAG_RE.search(text):
+            return "SCRIPT_TAG"
+
+        if EVENT_HANDLER_RE_2.search(text):
+            return "EVENT_HANDLER"
+
+        if DANGEROUS_SCHEME_TEXT_RE.search(text):
+            return "DANGEROUS_SCHEME"
+
+        urls = extract_urls("html", text)
+
+        for url in urls:
+            problem = classify_url_problem(url)
+
+            if problem == "DANGEROUS_SCHEME":
+                return "DANGEROUS_SCHEME"
+
+        for url in urls:
+            problem = classify_url_problem(url)
+
+            if problem == "EXTERNAL_EXFIL":
+                return "EXTERNAL_EXFIL"
+
+        return None
+
+    # Markdown rule order
+    if channel == "markdown":
+
+        if DANGEROUS_SCHEME_TEXT_RE.search(text):
+            return "DANGEROUS_SCHEME"
+
+        urls = extract_urls("markdown", text)
+
+        for url in urls:
+            problem = classify_url_problem(url)
+
+            if problem == "DANGEROUS_SCHEME":
+                return "DANGEROUS_SCHEME"
+
+        for url in urls:
+            problem = classify_url_problem(url)
+
+            if problem == "EXTERNAL_EXFIL":
+                return "EXTERNAL_EXFIL"
+
+        return None
+
+    # URL rule order
+    if channel == "url":
+
+        if DANGEROUS_SCHEME_TEXT_RE.search(text):
+            return "DANGEROUS_SCHEME"
+
+        problem = classify_url_problem(text.strip())
+
+        if problem:
+            return problem
+
+        return None
+
+    # SQL
+    if channel == "sql":
+
+        if SQL_META_RE.search(text):
+            return "SQL_METACHAR"
+
+        return None
+
+    # Shell
+    if channel == "shell":
+
+        if SHELL_META_RE.search(text):
+            return "SHELL_METACHAR"
+
+        return None
+
+    return None
+
+
+@app.post("/sanitize-output")
+def sanitize_output(payload: dict):
+
+    # ---------------------------------------------------------
+    # 1. INVALID_SCHEMA
+    # ---------------------------------------------------------
+
+    if not isinstance(payload, dict):
+        return {
+            "safe": False,
+            "reason": "INVALID_SCHEMA"
+        }
+
+    if set(payload.keys()) != {"channel", "output"}:
+        return {
+            "safe": False,
+            "reason": "INVALID_SCHEMA"
+        }
+
+    channel = payload.get("channel")
+    output = payload.get("output")
+
+    if channel not in VALID_CHANNELS:
+        return {
+            "safe": False,
+            "reason": "INVALID_SCHEMA"
+        }
+
+    if not isinstance(output, str):
+        return {
+            "safe": False,
+            "reason": "INVALID_SCHEMA"
+        }
+
+    if len(output) > 20000:
+        return {
+            "safe": False,
+            "reason": "INVALID_SCHEMA"
+        }
+
+    # ---------------------------------------------------------
+    # 2. ENCODED_PAYLOAD
+    # ---------------------------------------------------------
+
+    decoded = decode_once(output)
+
+    if decoded != output:
+        decoded_reason = channel_rule_reason(channel, decoded)
+
+        if decoded_reason is not None:
+            return {
+                "safe": False,
+                "reason": "ENCODED_PAYLOAD"
+            }
+
+    # ---------------------------------------------------------
+    # 3. ORIGINAL OUTPUT CHANNEL RULES
+    # ---------------------------------------------------------
+
+    reason = channel_rule_reason(channel, output)
+
+    if reason is not None:
+        return {
+            "safe": False,
+            "reason": reason
+        }
+
+    # ---------------------------------------------------------
+    # SAFE
+    # ---------------------------------------------------------
+
+    return {
+        "safe": True,
+        "reason": "SAFE"
+    }
