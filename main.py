@@ -390,3 +390,234 @@ def action_firewall(payload: dict):
         "decision": "allow",
         "reason": "ALLOW"
     }
+
+PROD_WORKSPACE = "prod-he204n"
+
+REQUIRED_LABELS = {
+    "owner": "student-muicl",
+    "environment": "production",
+    "cost_center": "cc-do8d"
+}
+
+ALLOWED_BACKENDS = {"gcs", "s3", "azurerm", "remote"}
+
+STATEFUL_TYPES = {
+    "storage_bucket",
+    "sql_database",
+    "persistent_disk"
+}
+
+ALLOWED_ACTIONS = {
+    "create",
+    "update",
+    "delete"
+}
+
+
+def terraform_invalid():
+    return {
+        "decision": "reject",
+        "reason": "INVALID_PLAN"
+    }
+
+
+@app.post("/terraform/plan")
+def terraform_plan(payload: dict):
+
+    # ---------------------------------------------------------
+    # 1. VALIDATE REQUEST AND NESTED VALUE TYPES
+    # ---------------------------------------------------------
+
+    if not isinstance(payload, dict):
+        return terraform_invalid()
+
+    expected_top_keys = {
+        "environment",
+        "state",
+        "providerVersion",
+        "destroyApproved",
+        "resource"
+    }
+
+    if set(payload.keys()) != expected_top_keys:
+        return terraform_invalid()
+
+    if not isinstance(payload.get("environment"), str):
+        return terraform_invalid()
+
+    if not isinstance(payload.get("providerVersion"), str):
+        return terraform_invalid()
+
+    if not isinstance(payload.get("destroyApproved"), bool):
+        return terraform_invalid()
+
+    state = payload.get("state")
+
+    if not isinstance(state, dict):
+        return terraform_invalid()
+
+    if set(state.keys()) != {"backend", "locked"}:
+        return terraform_invalid()
+
+    if not isinstance(state.get("backend"), str):
+        return terraform_invalid()
+
+    if not isinstance(state.get("locked"), bool):
+        return terraform_invalid()
+
+    resource = payload.get("resource")
+
+    if not isinstance(resource, dict):
+        return terraform_invalid()
+
+    expected_resource_keys = {
+        "address",
+        "type",
+        "action",
+        "labels",
+        "secret",
+        "forceDestroy"
+    }
+
+    if set(resource.keys()) != expected_resource_keys:
+        return terraform_invalid()
+
+    if not isinstance(resource.get("address"), str):
+        return terraform_invalid()
+
+    if not resource["address"]:
+        return terraform_invalid()
+
+    if not isinstance(resource.get("type"), str):
+        return terraform_invalid()
+
+    if not resource["type"]:
+        return terraform_invalid()
+
+    if not isinstance(resource.get("action"), str):
+        return terraform_invalid()
+
+    if resource["action"] not in ALLOWED_ACTIONS:
+        return terraform_invalid()
+
+    labels = resource.get("labels")
+
+    if not isinstance(labels, dict):
+        return terraform_invalid()
+
+    # label keys and values must be strings
+    for key, value in labels.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            return terraform_invalid()
+
+    secret = resource.get("secret")
+
+    if secret is not None and not isinstance(secret, str):
+        return terraform_invalid()
+
+    if not isinstance(resource.get("forceDestroy"), bool):
+        return terraform_invalid()
+
+    # ---------------------------------------------------------
+    # 2. ENVIRONMENT
+    # ---------------------------------------------------------
+
+    if payload["environment"] != PROD_WORKSPACE:
+        return {
+            "decision": "reject",
+            "reason": "ENVIRONMENT_MISMATCH"
+        }
+
+    # ---------------------------------------------------------
+    # 3. REMOTE STATE + LOCKING
+    # ---------------------------------------------------------
+
+    if (
+        state["backend"] not in ALLOWED_BACKENDS
+        or state["locked"] is not True
+    ):
+        return {
+            "decision": "reject",
+            "reason": "STATE_UNSAFE"
+        }
+
+    # ---------------------------------------------------------
+    # 4. PROVIDER PINNING
+    # ---------------------------------------------------------
+
+    provider_version = payload["providerVersion"].strip()
+
+    allowed_provider_versions = {
+        "6.2.1",
+        "= 6.2.1",
+        "~> 6.0"
+    }
+
+    if provider_version not in allowed_provider_versions:
+        return {
+            "decision": "reject",
+            "reason": "UNPINNED_PROVIDER"
+        }
+
+    # ---------------------------------------------------------
+    # 5. REQUIRED LABELS
+    # ---------------------------------------------------------
+
+    for key, expected_value in REQUIRED_LABELS.items():
+        if labels.get(key) != expected_value:
+            return {
+                "decision": "reject",
+                "reason": "MISSING_LABELS"
+            }
+
+    # ---------------------------------------------------------
+    # 6. SECRET SAFETY
+    # ---------------------------------------------------------
+
+    if secret is not None:
+
+        if (
+            len(secret) == 0
+            or not secret.startswith("secret://")
+            or len(secret) <= len("secret://")
+        ):
+            return {
+                "decision": "reject",
+                "reason": "PLAINTEXT_SECRET"
+            }
+
+    # ---------------------------------------------------------
+    # 7. STATEFUL DELETE APPROVAL
+    # ---------------------------------------------------------
+
+    if (
+        resource["action"] == "delete"
+        and resource["type"] in STATEFUL_TYPES
+        and payload["destroyApproved"] is not True
+    ):
+        return {
+            "decision": "reject",
+            "reason": "DELETE_NOT_APPROVED"
+        }
+
+    # ---------------------------------------------------------
+    # 8. PRODUCTION STORAGE BUCKET FORCE DESTROY
+    # ---------------------------------------------------------
+
+    if (
+        resource["type"] == "storage_bucket"
+        and resource["forceDestroy"] is True
+    ):
+        return {
+            "decision": "reject",
+            "reason": "FORCE_DESTROY"
+        }
+
+    # ---------------------------------------------------------
+    # APPROVE
+    # ---------------------------------------------------------
+
+    return {
+        "decision": "approve",
+        "reason": "APPROVE"
+    }
