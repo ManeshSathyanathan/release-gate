@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Body
 from pydantic import BaseModel, ConfigDict
 from typing import List, Dict, Any
 
@@ -958,7 +958,7 @@ def invalid_osint():
 
 
 @app.post("/corroborate")
-def corroborate(payload: Any):
+def corroborate(payload: Any = Body(...)):
 
     # ---------------------------------------------------------
     # 1. INVALID
